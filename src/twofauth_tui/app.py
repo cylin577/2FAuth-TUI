@@ -12,10 +12,23 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.screen import Screen
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Static
 
-from .client import ApiError, ProbeResult, TwoFAuthClient, normalize_server_url
+from .client import ApiError, TwoFAuthClient, normalize_server_url
 from .models import AccountView
-from .security import make_password_record, read_json, verify_password, write_json
-from .storage import CONFIG_FILE, PAT_FILE, PASSWORD_FILE, ensure_app_dir, has_setup, load_json, load_text, save_json, save_text
+from .security import make_password_record, verify_password, write_json
+from .storage import (
+    CONFIG_FILE,
+    PAT_FILE,
+    PASSWORD_FILE,
+    ensure_app_dir,
+    has_setup,
+    install_launcher,
+    launcher_exists,
+    launcher_file,
+    load_json,
+    load_text,
+    save_json,
+    save_text,
+)
 
 
 @dataclass(slots=True)
@@ -35,8 +48,12 @@ class BaseFormScreen(Screen[None]):
         panel.set_text("Status", text, style)
 
     def set_busy(self, busy: bool) -> None:
-        button = self.query_one("#continue", Button)
-        button.disabled = busy
+        for button_id in ("continue", "install"):
+            try:
+                self.query_one(f"#{button_id}", Button).disabled = busy
+                return
+            except Exception:
+                continue
 
 
 class ServerScreen(BaseFormScreen):
@@ -156,7 +173,70 @@ class PasswordSetupScreen(BaseFormScreen):
             return
         record = make_password_record(p1)
         write_json(PASSWORD_FILE, record)
-        self.set_status("Setup complete. Unlocking dashboard ...", "green")
+        if launcher_exists():
+            self.set_status("Password saved. Launcher already installed.", "green")
+            self.app.pop_screen()
+            self.app.push_screen(MainScreen())
+            return
+        self.set_status("Password saved. Next: optional launcher install.", "green")
+        self.app.pop_screen()
+        self.app.push_screen(InstallScreen())
+
+
+class InstallScreen(BaseFormScreen):
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Container(
+            Vertical(
+                Label("Install 2FAuth-TUI launcher"),
+                Static(id="launcher_info"),
+                *(
+                    [Button("Install launcher", id="install", variant="primary")]
+                    if not launcher_exists()
+                    else []
+                ),
+                Button("Skip", id="skip"),
+                MessagePanel(id="status"),
+            ),
+            id="form",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        if launcher_exists():
+            self.query_one("#launcher_info", Static).update(
+                f"Launcher already exists at {launcher_file()}\n"
+                "No install needed."
+            )
+            self.set_status("Launcher already installed. Continue to dashboard.", "green")
+            return
+
+        self.query_one("#launcher_info", Static).update(
+            f"Install launcher to {launcher_file()}\n"
+            "Then run `2fauth` from shell.\n"
+            "This step is optional, but handy for daily use."
+        )
+        self.set_status("Launcher uses `uv run --directory <repo> 2FAuth-TUI`.", "blue")
+
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "skip":
+            self.set_status("Skipped launcher install. Opening dashboard ...", "green")
+            self.app.pop_screen()
+            self.app.push_screen(MainScreen())
+            return
+
+        if event.button.id != "install":
+            return
+
+        self.set_busy(True)
+        try:
+            launcher = install_launcher(self.app.repo_root)
+        except Exception as exc:
+            self.set_busy(False)
+            self.set_status(f"Install failed: {exc}", "red")
+            return
+
+        self.set_status(f"Installed {launcher}. Make sure ~/.local/bin is on PATH.", "green")
         self.app.pop_screen()
         self.app.push_screen(MainScreen())
 
@@ -209,6 +289,11 @@ class MainScreen(Screen[None]):
             yield Vertical(
                 Static(id="summary"),
                 Static(id="details"),
+                *(
+                    [Button("Install launcher", id="install_launcher")]
+                    if not launcher_exists()
+                    else []
+                ),
                 id="side",
             )
         yield Footer()
@@ -294,6 +379,26 @@ class MainScreen(Screen[None]):
         self.app.pop_screen()
         self.app.push_screen(UnlockScreen())
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "install_launcher":
+            self._install_launcher()
+
+    def _install_launcher(self) -> None:
+        summary = self.query_one("#summary", Static)
+        try:
+            launcher = install_launcher(self.app.repo_root)
+        except Exception as exc:
+            summary.update(Panel(f"Launcher install failed: {exc}", title="Status", border_style="red"))
+            return
+        summary.update(
+            Panel(
+                f"Launcher installed at {launcher}\n"
+                "Run `2fauth` from shell when `~/.local/bin` is on PATH.",
+                title="Status",
+                border_style="green",
+            )
+        )
+
     async def reload(self) -> None:
         summary = self.query_one("#summary", Static)
         summary.update(Panel("Refreshing ...", title="Status"))
@@ -316,6 +421,11 @@ class MainScreen(Screen[None]):
 
 class TwoFAuthTuiApp(App[None]):
     TITLE = "2FAuth-TUI"
+    BINDINGS = [
+        ("r", "refresh", "Refresh"),
+        ("l", "lock", "Lock"),
+        ("q", "quit", "Quit"),
+    ]
     CSS = """
     Screen {
         align: center middle;
@@ -351,6 +461,7 @@ class TwoFAuthTuiApp(App[None]):
         self.client: TwoFAuthClient | None = None
         self.views: list[AccountView] = []
         self._password: str | None = None
+        self.repo_root = Path(__file__).resolve().parents[2]
 
     def on_mount(self) -> None:
         if has_setup():
